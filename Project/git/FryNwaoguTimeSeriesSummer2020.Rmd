@@ -1,0 +1,1455 @@
+---
+title: "Covid Analyis - Oklahoma and National"
+author: "Edward Fry and Ikenna Nwaogu"
+date: "7/20/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(warn = -1, scipen = 999)
+
+library(orcutt)
+library(tswge)
+library(tidyverse)
+library(nnfor)
+library(tsbox)
+library(vars)
+library(forecast)
+
+# Additional fonts for plots
+library(extrafont)
+#font_import()  # Run if you get font missing warnings
+#loadfonts(device = "win")
+```
+
+```{r function.defs}
+format.terms = function (terms)
+{
+  # Identify the pieces of this operand
+  power = length(terms)   # The number of terms will equal the power of the current term
+  term = tail(terms, 1)   # Examine the last term
+  sign = ifelse(term > 0, ' - ', ' + ')  # The signs are opposite of the phi's/theta's
+  term = format(abs(term), digits = 2, nsmall = 0)  # Neat number formatting
+  
+  # Put the pieces of this term together
+  operand = paste0(sign, term, 'B', ifelse(power > 1, paste0('^', power), ''))   
+
+  # Concatenate this term recursively with the rest of the expression
+  if (power > 0) return (paste0(format.terms(head(terms, power - 1)), operand))
+}
+
+format.glp = function (phi, theta, d, s, m, v)
+{
+  # Take the pieces of a time series model and format them in a GLP format
+  
+  # Construct each of the pieces
+  ar = ifelse(phi[1] != 0, paste0('(1', format.terms(phi), ')'), '')  # Assemble the AR portion
+  ma = ifelse(theta[1] != 0, paste0('(1', format.terms(theta), ')'), '')  # Assemble the MA portion
+  i = ifelse(d != 0, paste0('(1 - B)', ifelse(d > 1, paste0('^', d), '')), '')  # Assemble the I portion
+  seasonal = ifelse(s != 0, paste0('(1 - B', ifelse(s > 1, paste0('^', s), ''), ')'), '')  # Assemble the seasonal portion
+  xt = ifelse(m != 0, paste0('(Xt', ifelse(m > 0, ' - ', ' + '), format(abs(m), digits = 2, nsmall = 0), ')'), 'Xt')  # Assemble the xt portion
+  vara = ifelse(v != 0, paste0(', with a variance of ', format(abs(v), digits = 2, nsmall = 2)), '')  # Assemble the variance portion
+
+  # Assemble the pieces into the final model
+  return (paste0(i, seasonal, ar, xt, ' = ', ma, 'at', vara))
+}
+```
+
+## Goal 1: Data Collection
+### Oklahoma
+We chose Oklahoma for our state since one of the project contributors lives there.
+
+#### Where the data came from
+The data for our state comes from the Covid Tracking site, which is a superb source of data for both state and national data.  We found it to be superior to the data that was available directly from the state.
+``` {r}
+# Load the state data
+uri.data = 'https://covidtracking.com/api/v1/states/ok/daily.csv'
+ok = read.csv(uri.data, header = T)
+head(ok)
+
+# The data is presented in reverse date order, so we need to reverse 
+# the rows to work with it.
+ok = ok[nrow(ok):1,]
+ok = ok %>% filter(date > 20200229)   # Start february 29
+head(ok)
+```
+
+#### Positive percentage
+For the positive percentage, we will look at the percentage of people who tested positive out of all tests with results.  This will be the primary variable that we perform the analysis on.  We can also look at the positives out of the total state population.  After looking at both, while it is interesting to see the growth of the population, we ultimately chose to use the count of positive tests.
+
+#### Exploratory data analysis
+``` {r}
+# First, reduce to interesting columns and difference some of the data that is being 
+# reported cumulatively so that we have just each day's numbers.  Also, prepend an NA
+# on the differenced lines since they will be one element shorter than the other columns
+# after diffing.
+ok = data.frame(date = as.factor(ok$date), positive = c(NA, diff(ok$positive)), 
+                negative = c(NA, diff(ok$negative)), 
+                hospitalizedCurrently = ok$hospitalizedCurrently,
+                inIcuCurrently = ok$inIcuCurrently, 
+                recovered = c(NA, diff(ok$recovered)), 
+                death = c(NA, diff(ok$death)))
+ok$positive_pct = round(ok$positive/(ok$positive + ok$negative) * 100, 2)
+ok$positive_pop_pct = round(ok$positive/3.94e6 * 100, 2) # Pct of population
+n = nrow(ok)
+
+# We need to clean up the NAs or plotts will fail
+ok$negative[is.na(ok$negative)] = 0
+ok$positive[is.na(ok$positive)] = 0
+ok$recovered[is.na(ok$recovered)] = 0
+ok$death[is.na(ok$death)] = 0
+ok$inIcuCurrently[is.na(ok$inIcuCurrently)] = 0
+ok$hospitalizedCurrently[is.na(ok$hospitalizedCurrently)] = 0
+ok$positive_pct[is.na(ok$positive_pct)] = 0
+
+summary(ok)
+
+# Plot the key metrics to see how they compare
+plot(ok$negative, type = "l", col = "green", ylab = "People")
+lines(ok$positive, type = "l", col = "red")
+lines(ok$recovered, type = "l", col = "blue")
+lines(ok$death, type = "l", col = "black")
+lines(ok$hospitalizedCurrently, type = "l", col = "orange")
+lines(ok$inIcuCurrently, type = "l", col = "purple")
+legend("topleft", legend=c("Negative", "Positive", "Recovered", "Death", "Hospitalized", "ICU"), text.col = c("green", "red", "blue", "black", "orange", "purple"))
+
+# Negative tests dominates the plot, so let's look again without it
+plot(ok$positive, type = "l", col = "red", ylab = "People")
+lines(ok$recovered, type = "l", col = "blue")
+lines(ok$death, type = "l", col = "black")
+lines(ok$hospitalizedCurrently, type = "l", col = "orange")
+lines(ok$inIcuCurrently, type = "l", col = "purple")
+legend("topleft", legend=c("Positive", "Recovered", "Death", "Hospitalized", "ICU"), text.col = c("red", "blue", "black", "orange", "purple"))
+
+# Again, positive and recovered are dominating, so remove them
+plot(ok$death, type = "l", col = "black", ylab = "People")
+lines(ok$hospitalizedCurrently, type = "l", col = "orange")
+lines(ok$inIcuCurrently, type = "l", col = "purple")
+legend("topleft", legend=c("Death", "Hospitalized", "ICU"), text.col = c("black", "orange", "purple"))
+
+# Take a peek at correlations, though we would imagine the 
+# data is mostly very correlated given its nature
+pairs(ok)
+
+# We can view the same data as a stacked histogram
+plot(ok$positive, type = "h", col = "red", ylab = "People")
+lines(ok$recovered, type = "h", col = "blue")
+lines(ok$death, type = "h", col = "black")
+lines(ok$hospitalizedCurrently, type = "h", col = "orange")
+lines(ok$inIcuCurrently, type = "h", col = "purple")
+legend("topleft", legend=c("Positive", "Recovered", "Death", "Hospitalized", "ICU"), text.col = c("red", "blue", "black", "orange", "purple"))
+
+# Now, let's take a look at the positive percentage by testing
+#plot(ok$positive_pct, type = 'l', col = "black", ylab = "Positive Percent by Tests Administered (%)", lwd = 3)
+ggplot(data = ok, aes(x = seq(1, n), y = positive_pct)) +
+  geom_line(color = 'blue') +
+  labs(title = 'Positive Percent by Tests Administered (%)', x = 'Time', y = 'Positive Percentage') +
+  theme(plot.title = element_text(hjust = .5, family = 'Franklin Gothic Demi'),
+        plot.subtitle = element_text(hjust = .5, color = 'red', face = 'italic', family = 'Franklin Gothic Demi'),
+        axis.title = element_text(face = 'italic', family = 'Franklin Gothic Medium'))
+
+# Take a look at the positive percentage by population
+#plot(ok$positive_pop_pct, type = 'l', col = "black", ylab = "Positive Percent by Oklahoma Population (%)", lwd = 3)
+ggplot(data = ok, aes(x = seq(1, n), y = positive_pop_pct)) +
+  geom_line(color = 'yellow') +
+  labs(title = 'Positive Percent by Oklahoma Population (%)', x = 'Time', y = 'Positive Percentage') +
+  theme(plot.title = element_text(hjust = .5, family = 'Franklin Gothic Demi'),
+        plot.subtitle = element_text(hjust = .5, color = 'red', face = 'italic', family = 'Franklin Gothic Demi'),
+        axis.title = element_text(face = 'italic', family = 'Franklin Gothic Medium'))
+
+# Take a look at the positive percentage by count
+#plot(ok$positive, type = 'l', col = "black", ylab = "Positive Test Count", lwd = 3)
+ggplot(data = ok, aes(x = seq(1, n), y = positive)) +
+  geom_line(color = 'red') +
+  labs(title = 'Positive Test Count', x = 'Time', y = 'Positive Test Count') +
+  theme(plot.title = element_text(hjust = .5, family = 'Franklin Gothic Demi'),
+        plot.subtitle = element_text(hjust = .5, color = 'red', face = 'italic', family = 'Franklin Gothic Demi'),
+        axis.title = element_text(face = 'italic', family = 'Franklin Gothic Medium'))
+```
+
+### National
+#### Positive percentage
+In the code below, we derived the daily positive percent with respect to the total results given. We found out that even thought the national positive results is increasing the percent rate is actually declining. The realization seems to be stationary because we have a slowly damping sample autocorrelation and the parzen window shows a prevelant peak at 0.
+``` {r}
+library(GGally)
+uri.data = 'https://covidtracking.com/api/v1/states/daily.csv'
+national = read.csv(uri.data, header = T)
+
+usCovidClean <- national %>% replace(is.na(.), 0)
+DataUsing <- usCovidClean %>% dplyr::select(date,'positive',negative,hospitalizedCurrently,onVentilatorCurrently,recovered,death,deathConfirmed,death,totalTestResults, inIcuCurrently, pending,positiveIncrease,negativeIncrease,deathIncrease)
+summary(DataUsing)
+
+# We ignored using only data quality that scored at C because we have 1100 non labelled which is a lot to ignore. We only group by date
+dataGrouped <-DataUsing %>% dplyr::group_by(date) %>% dplyr::group_by(date) %>% summarise_each(tibble::lst(sum))
+#ddply(usCovid, .(date), summarise, medABV=sum(positive))
+dataGrouped<- dataGrouped %>% filter(date > 20200229)   # Start february 29
+
+
+# select start date 
+datalagged = as.data.frame(lapply(dataGrouped[,2:length(dataGrouped)], diff, lag=1))
+datalagged <- datalagged %>% mutate(positive_perc = (positive_sum/totalTestResults_sum)*100)
+datalagged <- datalagged %>% replace(is.na(.), 0)
+
+dataGrouped<- as.data.frame(dataGrouped)
+dataGrouped$date <- as.factor(dataGrouped$date)
+
+
+datalagged$date <- as.factor(dataGrouped$date[1:1-length(dataGrouped$date)])
+datalagged<- as.data.frame(datalagged)
+datalagged$date <- as.factor(dataGrouped$date[1:1-length(dataGrouped$date)])
+datalagged %>% ggplot(aes( y=positive_perc, x=date,colour=positive_perc)) + geom_bar(stat="identity") + guides(fill = T) + scale_colour_gradientn(colours=rainbow(10))
+
+
+dataGrouped <- dataGrouped%>% mutate(positive_perc = (positiveIncrease_sum/totalTestResults_sum)*100)
+
+plotts.sample.wge(dataGrouped$positive_perc)
+
+
+```
+
+#### Exploratory data analysis Histogram
+We expored the different aspects of the data to see if we can find some relationships between the variables by understanding data through EDA. We lagged some of the variables because they were represented in daily total cumulative. we looked at for example cases where covid patients are currently hospitalized and it seems like there were 2 peaks to identify.
+``` {r}
+dataGrouped %>% ggplot(aes( y=hospitalizedCurrently_sum, x=date,colour=hospitalizedCurrently_sum)) + geom_bar(stat="identity") + guides(fill = T) + scale_colour_gradientn(colours=rainbow(10)) + ggtitle('Covid Patients Currently Hospityalized')
+
+dataGrouped %>% ggplot(aes( y=onVentilatorCurrently_sum, x=date,colour=onVentilatorCurrently_sum)) + geom_bar(stat="identity") + guides(fill = T) + scale_colour_gradientn(colours=rainbow(10)) + ggtitle('Covid Patients Currently On Ventilators')
+
+dataGrouped %>% ggplot(aes( y=pending_sum, x=date,colour=pending_sum)) + geom_bar(stat="identity") + guides(fill = T) + scale_colour_gradientn(colours=rainbow(10)) + ggtitle('Covid Patients With Pending Results')
+
+dataGrouped %>% ggplot(aes( y=inIcuCurrently_sum, x=date,colour=inIcuCurrently_sum)) + geom_bar(stat="identity") + guides(fill = T) + scale_colour_gradientn(colours=rainbow(10)) + ggtitle('Covid Patients Currently In ICU')
+
+datalagged %>% ggplot(aes( y=positive_sum, x=date,colour=positive_sum)) + geom_bar(stat="identity") + guides(fill = T) + scale_colour_gradientn(colours=rainbow(10)) + ggtitle('Daily Positive Cases')
+
+datalagged %>% ggplot(aes( y=negative_sum, x=date, colour=negative_sum)) + geom_bar(stat="identity") + scale_colour_gradientn(colours=rainbow(5)) + ggtitle('Daily Negative Cases')
+
+datalagged %>% ggplot(aes( x=positive_sum, y=negative_sum, colour=positive_sum)) + geom_point() + scale_colour_gradientn(colours=rainbow(5)) + ggtitle('Daily Positive Cases vs Daily Negative Cases')
+
+datalagged %>% ggplot(aes( y=totalTestResults_sum, x=date, colour=totalTestResults_sum)) + geom_bar(stat = 'identity') + scale_colour_gradientn(colours=rainbow(5)) + ggtitle('Daily Total Test Results')
+
+datalagged %>% ggplot(aes( y=recovered_sum, x=date, colour=recovered_sum)) + geom_bar(stat = 'identity') + scale_colour_gradientn(colours=rainbow(5)) + ggtitle('Daily Covid Patients Recovered')
+
+datalagged %>% ggplot(aes( y=death_sum, x=date,colour=death_sum)) + geom_bar(stat="identity") + guides(fill = T) + scale_colour_gradientn(colours=rainbow(10)) + ggtitle('Daily Death Rate')
+```
+
+#### Exploratory data analysis
+
+
+## Goal 2: Univariate Analysis
+
+### Oklahoma
+In this section, we will look at some basic plots to determine how to approach the positive percentage.
+
+#### Stationarity
+To examine stationarity, we need to make sure the mean and standard deviation are not dependent on time and that the correlation between two points depends only on its lag and not the time.
+``` {r}
+# Look at the basic time series plot for the positive percentage
+plotts.sample.wge(ok$positive)
+```
+Both the mean and standard deviation appear to trend upward over time, and the ACF shows a gradually damping behavior perhaps with a very slight sinusoidal tendency.  Based on this, the positive counts do not appear to be stationary.
+
+#### Identification of stationary models
+We can overfit assuming stationarity to obtain potential models.  Then, we can use Llung-Box to verify that if we remove the stationary part of the model that all that is left is white noise.
+```{r}
+arma.aic = aic.wge(ok$positive, p = 0:15, q = 0:10)
+arma.aic.name = paste('ARMA(', arma.aic$p, ', ', arma.aic$q, ')', sep = '')
+arma.bic = aic.wge(ok$positive, p = 0:15, q = 0:10, type = 'bic')
+arma.bic.name = paste('ARMA(', arma.bic$p, ', ', arma.bic$q, ')', sep = '')
+
+est = est.arma.wge(ok$positive, p = arma.bic$p, q = arma.bic$q)
+pos.mean = mean(ok$positive)
+
+plotts.sample.wge(est$res, arlimits = T)
+
+lj24 = ljung.wge(est$res, p = arma.bic$p)
+lj24$pval
+
+lj48 = ljung.wge(est$res, p = arma.bic$p, K = 48)
+lj48$pval
+```
+Attemping to overfit the data, an AIC check returned an optimal fit at 
+`r arma.aic.name`
+.  This is a pretty complex model, so we checked with BIC.  That returned a more reasonable 
+`r arma.bic.name`
+, so we went with that.
+
+Factoring the model as an 
+`r arma.bic.name`
+ reveals just one root just barely outside the unit circle (possible 1-B alert!).  Interestingly, there is only one frequency at 0, which account for the realization wandering for the root at 0, though the spectral density seems to show very slight peaks at .11 and .31.  There doesn't seem to be any trend beyond a steady increase in positives.
+
+None the ACFs for the residuals exceeds the limit lines, which would be consistent with a 95% confidence interval, and the plot looks like white noise.  We can confirm that this is white noise.  As for the Llung-Box test, both K = 24 (p-value = 
+`r format(lj24$pval, digits = 3, nsmall = 2)`
+) and K = 48 (p-value = 
+`r format(lj48$pval, digits = 3, nsmall = 2)`
+) strongly failed to reject null that the residuals are white noise.  This is the result if we model it as a stationary model, remembering that it is ultimately the analyst's choice of which to choose.
+
+However, let's also see what happens if we do some differencing, treating it as a non-stationary model.
+``` {r}
+# Look at the first difference of the data
+pos.d1 = artrans.wge(ok$positive, phi.tr = 1)
+
+# It looks stationary from the plots, so let's try and estimate p and q
+arma.aic.d1 = aic.wge(pos.d1, p = 0:15, q = 0:10) 
+arma.aic.d1.name = paste('ARIMA(', arma.aic.d1$p, ', 1, ', arma.aic.d1$q, ')', sep = '')
+arma.bic.d1 = aic.wge(pos.d1, p = 0:15, q = 0:10, type = "bic")
+arma.bic.d1.name = paste('ARIMA(', arma.bic.d1$p, ', 1, ', arma.bic.d1$q, ')', sep = '')
+
+# Now estimate the difference
+est.d1 = est.arma.wge(pos.d1, p = arma.bic.d1$p, q = arma.bic.d1$q)
+est.d1$phi
+est.d1$theta
+est.d1$avar
+mean(ok$positive)
+```
+
+After looking at the differenced data, the final model was an 
+`r arma.bic.name`
+ with a (1 - B) term.  The final model is 
+`r format.glp(arma.bic.d1$phi, arma.bic.d1$theta, 1, 0, mean(ok$positive), arma.bic.d1$vara)`
+.  While this is interesting, we will proceed with the original 
+`r arma.bic.name`
+  model for further analysis.  This is because we believe that the data will eventually be more or less normally distributed and attract back to a mean once the number of cases begins to drop in the months ahead.
+
+#### Model building with ACFs, spectral densities, etc.
+Let's look at the true spectral density of the estimated 
+`r arma.bic.name`
+ model and compare to the original data.
+```{r}
+plotts.true.wge(phi = est$phi)
+plotts.sample.wge(ok$positive)
+x.gen = gen.arma.wge(n = 100, phi = est$phi)
+x.gen = x.gen + pos.mean
+plotts.sample.wge(x.gen)
+```
+While the realization appears different from the original data's realization, both the ACFs and spectral densities appear very similar.  The spectral density has (very small) peaks at the same spots, and the ACF show minor sinusoidal and slowly damping behavior.
+
+#### Evaluate candidate models
+We need to evaluate the 
+`r arma.bic.name`
+ model and also compare it to a possible weekly seasonal model.
+
+##### ARMA/ARIMA model
+The final possible 
+`r arma.bic.name`
+ model would be 
+`r format.glp(arma.bic$phi, arma.bic$theta, 0, 0, mean(ok$positive), arma.bic$vara)`
+.
+
+###### AIC
+```{r}
+fore.7days = fore.arma.wge(ok$positive, phi = est$phi, n.ahead = 7, lastn = T)
+fore.90days = fore.arma.wge(ok$positive, phi = est$phi, n.ahead = 90, lastn = T)
+
+arma.aic$value
+arma.bic$value
+```
+The AIC is 
+`r format(arma.aic$value, digits = 3, nsmall = 2)`
+, and the BIC is 
+`r format(arma.bic$value, digits = 3, nsmall = 2)`
+.
+
+###### ASE
+```{r}
+ASE.AR7.7days = mean((fore.7days$f - ok$positive[(n-7+1):n])^2)
+ASE.AR7.90days = mean((fore.90days$f - ok$positive[(n-90+1):n])^2)
+ASE.AR7.7days
+ASE.AR7.90days
+```
+The ASE for a 7 day forecast is 
+`r ifelse(ASE.AR7.7days < ASE.AR7.90days, 'better ', 'worse ')`
+than the ASE for a 90 day forecast.
+
+###### Visualization
+We can use the 
+`r arma.bic.name`
+ model to predict the next 7 and 90 days.
+``` {r}
+fore.arma.wge(ok$positive, phi = est$phi, n.ahead = 7, lastn = F)
+fore.arma.wge(ok$positive, phi = est$phi, n.ahead = 90, lastn = F)
+```
+The visual for the 7 day forecast appears very similar initially to recent spikes in the positive count and then trails toward the mean.  Because the time horizon is so much longer on the 90 day forecast, you can definitely see it diminishing toward the mean over time.
+
+##### ARMA/ARIMA model
+Given that the period of 7 is likely considering the nature of the data, it's also possible we may be dealing with a seasonal model that repeats weekly.  Let's explore that possibility.  First, if we assume that there is a (1 - B^7) term, then let's remove that and see what we have left.
+```{r}
+ok.d = artrans.wge(ok$positive, phi.tr = c(rep(0, 6), 1))
+```
+
+Since the resulting difference after removing (1-B^7) doesn't appear white, let's see if we can fit an ARMA model to the remainder.
+``` {r}
+ok.d.aic = aic.wge(ok.d, p = 0:15, q = 0:10)
+ok.d.aic.name = paste('ARMA(', ok.d.aic$p, ', ', ok.d.aic$q, ')', sep = '')
+ok.d.bic = aic.wge(ok.d, p = 0:15, q = 0:10, type = 'bic')
+ok.d.bic.name = paste('ARMA(', ok.d.bic$p, ', ', ok.d.bic$q, ')', sep = '')
+
+ok.d.aic 
+ok.d.bic
+```
+The AIC analysis of the non-seasonal portion picked an 
+`r ok.d.aic.name`
+ model, and the non-seasonal part of BIC chose 
+`r ok.d.bic.name`
+.  The BIC is not only clearly much simpler but also indicates some likely cancellation of the terms in AIC.  We will choose the BIC form, which would leave us with a seasonal model of 
+`r format.glp(ok.d.bic$phi, ok.d.bic$theta, 0, 7, mean(ok$positive), ok.d.bic$vara)`
+.
+
+###### AIC
+``` {r}
+ok.d.aic$value
+ok.d.bic$value
+```
+Again, the AIC is a bit lower at 
+`r format(ok.d.aic$value, digits = 2, nsmall = 2)`
+; however, the BIC of 
+`r format(ok.d.bic$value, digits = 2, nsmall = 2)`
+ is close and results in a simpler model.
+
+###### ASE
+Now we need to calculate the forecasted values in order to find the ASE for both 7 and 90 days.
+``` {r}
+fore.seasonal.7days = fore.aruma.wge(ok$positive, s = 7, n.ahead = 7, lastn = T)
+fore.seasonal.90days = fore.aruma.wge(ok$positive, s = 7, n.ahead = 90, lastn = T)
+
+ASE.seasonal.7days = mean((fore.seasonal.7days$f - ok$positive[(n-7+1):n])^2)
+ASE.seasonal.90days = mean((fore.seasonal.90days$f - ok$positive[(n-90+1):n])^2)
+ASE.seasonal.7days
+ASE.seasonal.90days
+```
+Again, the ASE for the 7 day forecast is 
+`r ifelse(ASE.seasonal.7days < ASE.seasonal.90days, 'better ', 'worse ')`
+than for the 90 day forecast.  Interestingly, the 7 day seasonal forecast is also 
+`r ifelse(ASE.seasonal.7days < ASE.AR7.7days, 'better ', 'worse ')`
+than the 7 day 
+`r arma.bic.name`
+ model; however, the seasonal 3 month forecast is 
+`r ifelse(ASE.seasonal.90days < ASE.AR7.90days, 'better ', 'worse ')`
+than the 
+`r arma.bic.name`
+ model.
+
+###### Visualization
+Let's use the seasonal model to predict into the future.
+``` {r}
+fore.aruma.wge(ok$positive, s = 7, n.ahead = 7, lastn = F)
+fore.aruma.wge(ok$positive, s = 7, n.ahead = 90, lastn = F)
+```
+You can see from the visualization of the seasonal model that the next 7 days prediction appears almost the same as recent data points.  The 90 day model also replicates the pattern, continuing the trend at the point where we started forecasting.
+
+##### MLP/RNN model
+For the MLP model, we first allowed the mlp function to take its best guess at fitting the data and parameters, after which we plotted the model, forecast using the model, and plotted that forecast. 
+``` {r}
+# Put our data into to a time series object
+pos.ts.train = ts(data = ok$positive, start = 1, end = round(n*.8))
+pos.ts.test = ts(data = ok$positive, start = (length(pos.ts.train) + 1), end = n)
+
+# Fit an MLP model
+set.seed(2)
+pos.mlp = mlp(pos.ts.train, reps = 50, comb = "mean")
+pos.mlp
+plot(pos.mlp)
+
+# Forecast the model to find the ASE
+pos.mlp.fore = forecast(pos.mlp, h = length(pos.ts.test))
+plot(pos.mlp.fore)
+
+# Calculate the ASE
+pos.mlp.ase = mean((pos.ts.test - pos.mlp.fore$mean)^2)
+pos.mlp.ase
+
+# Now try the MLP without seasonal using weekly lags
+pos.mlp2 = mlp(pos.ts.train, reps = 50, comb = "mean", allow.det.season = F, lags = c(1,2,3,4,5,6,7))
+pos.mlp2
+plot(pos.mlp2)
+
+# Forecast the model to find the ASE
+pos.mlp.fore2 = forecast(pos.mlp2, h = length(pos.ts.test))
+plot(pos.mlp.fore2)
+
+# Calculate the ASE
+pos.mlp.ase2 = mean((pos.ts.test - pos.mlp.fore2$mean)^2)
+pos.mlp.ase2 
+```
+The ASE was 
+`r format(pos.mlp.ase, digits = 2, nsmall = 2)`
+.  Then, we took the reigns a bit and disabled seasonality while specifying weekly lags.  The resulting ASE was 
+`r format(pos.mlp.ase2, digits = 2, nsmall = 0)`
+.  The first ASE is slightly 
+`r ifelse(pos.mlp.ase < pos.mlp.ase2, 'better', 'worse')`
+, so that is the model that we will use.
+
+For the 7 and 90 day forecasts, we first retrained the model using all of the data available.  If we had only used the training set, then a substantial portion of the trend to date would be lost, and the resulting forecasts would be way off.  Next, we forecast for 7 and 90 days.  Both forecasts continue the trend that was immediately before the forecast range.
+
+``` {r}
+# The first MLP model wins, so use that for the 7 and 90 day forecasts
+# First, train the model using the entire dataset
+pos.ts.full = ts(data = ok$positive, start = 1, end = n)
+pos.mlp.full = mlp(pos.ts.full, reps = 50, comb = "mean")
+
+# Now forecast into the future 7 days
+pos.mlp.fore.7day = forecast(pos.mlp.full, h = 7)
+plot(pos.mlp.fore.7day)
+
+# .. and 90 days
+pos.mlp.fore.90day = forecast(pos.mlp.full, h = 90)
+plot(pos.mlp.fore.90day)
+```
+h
+##### Ensemble model
+``` {r}
+# Put together the ensemble model - 7 days
+ensemble.7day.pred = (fore.7days$f + fore.seasonal.7days$f + pos.mlp.fore.7day$mean) / 3
+ensemble.7day.ul = (fore.7days$ul + fore.seasonal.7days$ul) / 2
+ensemble.7day.ll = (fore.7days$ll + fore.seasonal.7days$ll) / 2
+
+# Prepare the data frames
+df.obs = data.frame(time = seq(1, n), obs = ok$positive, group = "obs")  # Original data
+df.preds = data.frame(time = seq((n+1), (n+length(ensemble.7day.pred))), obs = as.numeric(ensemble.7day.pred), group = "pred")  # Predictions with confidence limits
+
+# Plot the predictions
+ggplot(data = df.obs, aes(x = time, y = obs)) +
+  geom_line(color = 'black') +
+  labs(title = 'Ensemble Forecasts', subtitle = '7 Days', x = 'Days from Start of Outbreak', y = 'Patients Who Tested Positive') +
+  geom_smooth(aes(x = time, y = obs, ymax = ensemble.7day.ul, ymin = ensemble.7day.ll), color = 'red', data = df.preds, stat = "identity") +
+  theme(plot.title = element_text(hjust = .5, family = 'Franklin Gothic Demi'),
+        plot.subtitle = element_text(hjust = .5, color = 'red', face = 'italic', family = 'Franklin Gothic Demi'),
+        axis.title = element_text(face = 'italic', family = 'Franklin Gothic Medium'))
+
+# Put together the ensemble model - 90 days
+ensemble.90day.pred = (fore.90days$f + fore.seasonal.90days$f + pos.mlp.fore.90day$mean) / 3
+ensemble.90day.ul = (fore.90days$ul + fore.seasonal.90days$ul) / 2
+ensemble.90day.ll = (fore.90days$ll + fore.seasonal.90days$ll) / 2
+
+# Prepare the data frames
+df.obs = data.frame(time = seq(1, n), obs = ok$positive, group = "obs")  # Original data
+df.preds = data.frame(time = seq((n+1), (n+length(ensemble.90day.pred))), obs = as.numeric(ensemble.90day.pred), group = "pred")  # Predictions with confidence limits
+
+# Plot the predictions
+ggplot(data = df.obs, aes(x = time, y = obs)) +
+  geom_line(color = 'black') +
+  labs(title = 'Ensemble Forecasts', subtitle = '90 Days', x = 'Days from Start of Outbreak', y = 'Patients Who Tested Positive') +
+  geom_smooth(aes(x = time, y = obs, ymax = ensemble.90day.ul, ymin = ensemble.90day.ll), color = 'red', data = df.preds, stat = "identity") +
+  theme(plot.title = element_text(hjust = .5, family = 'Franklin Gothic Demi'),
+        plot.subtitle = element_text(hjust = .5, color = 'red', face = 'italic', family = 'Franklin Gothic Demi'),
+        axis.title = element_text(face = 'italic', family = 'Franklin Gothic Medium'))
+```
+The ensemble models are an average of the three other models; stationary, seasonal, and mlp.  The 7-day ensemble definitely seems to continue the prevailing trend, whereas the 90-day ensemble continues forward around a mean near the final point of the data.
+
+### National
+
+#### Stationarity
+Looking at the plot it looks stationary because the realization seems to be wandering. The spectral density has a peak at 0. The sample correlation is steadily fading/damping as the lag grows. There is also another small peak at around 0.14. We suspect that it is stationary.
+``` {r}
+
+dailyRates <- datalagged$positive_sum
+plotts.sample.wge(dailyRates)
+
+```
+#### Identification of stationary models
+We will overfit with aic to see what the p and q for the realization would be using aic with type bic. AIC picks an AR(10). We looked at acquired factor table and we didn't see any factors that were consitent with aruma or arima models so we proceed with the AR(10) model. We conclude that the data is likely Stationary.
+``` {r}
+aic.dailyRates = aic.wge(dailyRates, p = 0:15, q = 0:1, type='bic')
+
+est.dailyRates = est.arma.wge(dailyRates,p=aic.dailyRates$p)    # we conclude it is an AR model 10 with mle
+aic.dailyRates$p
+aic.dailyRates$vara
+mean(dailyRates)
+```
+The mean is `r mean(dailyRates)` and the variance is `r aic.dailyRates$vara`.
+
+#### Model building with ACFs, spectral densities, etc.
+
+
+#### Evaluate candidate models
+##### AR(10)
+When evaluating the different models, we checked the model residual to see if it consistent with white noise. We will compare AR(10) with signal plus noise model when we are assuming it isn't white noise. Because the realization has a upward trend, it might be non stationary. So we would evaluate and test both models. But first we would look at the AR(10) model first. We would check to see if the residuals are white noise. We will use both ljung-box test and acf to test for white noise.
+```{r}
+# AR(10) model
+acf(est.dailyRates$res)  # This is consistent with white noise
+lj = ljung.wge(est.dailyRates$res, p = 10)
+lj$pval # 0.75 so we failed to reject. There is evidence that this might be white noise
+
+ljk = ljung.wge(est.dailyRates$res, p = 10, K = 48)
+ljk$pval # 0.96 so we failed to reject. There is evidence that this is white noise
+
+```
+The test shows that there is evidence that the residuals for the AR(10) model is white noise. The p-value is `r lj$pval` so we failed to reject the null hypothesis.
+
+###### AIC
+```{r}
+aic.dailyRates$phi
+```
+The above code shows the phis used to generate the AR(10) model.
+
+###### ASE
+We used the last 10 realization point to calculate the ASE of the model performance.
+```{r}
+# ASE
+l = length(dailyRates)
+f = l-10
+foreDailyRates = fore.arma.wge(dailyRates, phi = est.dailyRates$phi, lastn = T, n.ahead = 10, limits = F)
+ASE = mean((foreDailyRates$f - dailyRates[f:l])^2)
+ASE
+ASE_AR_10 = ASE
+MAE = sqrt(ASE)
+
+AR_10_DF = data.frame(Model = 'AR(10)', Mean_ABS_Error = MAE, Mean_Square_Error = ASE)
+```
+The ASE comes out to be `r ASE`
+
+##### AR(10) forcast
+The forecast did somewhat of a good job but knowing that AR and ARMA models would always trend towards the mean we expect the trend to move towards the mean. We suspect that as the forecast moves away or goes further in the future it would fade into predicting the mean. Below shows the forecasts for 7 day period and a 90 day period with the upper and lower limits.
+```{r}
+# Forecast 7 days
+fore.arma.wge(dailyRates, phi = est.dailyRates$phi, n.ahead = 7, limits = T) # Did somewhat of a good job but knowing that AR and ARMA models would always trend towards the mean we expect 
+# the trend to move towards the mean. We suspect that as the forecast moves away or oges further in the future it would fade into predicting the mean.
+
+# Forecast 90 days
+fore.arma.wge(dailyRates, phi = est.dailyRates$phi, n.ahead = 90, limits = T) 
+```
+
+##### Signal Plus Noise Model
+Second Model would be Signal plus noise model. We fit a trend as the independent variable with the daily rates as the dependent variable.
+```{r}
+# Signal plus noise
+x = dailyRates
+n = length(x)
+t = 1:n
+d = lm(x~t)
+x.z = x - d$coefficients[1] - d$coefficients[2]*t
+
+
+ar.z = aic.wge(x.z, p = 0:15) # ar.z$p is 10
+```
+###### AIC
+We over fitted the new realization into the aic.wge function and the aic also recommended AR(10). Below we would transform both the trend and the daily rates.
+```{r}
+# Tranform the dependent varible daily rates 
+y.trans = artrans.wge(x, phi.tr = ar.z$phi)
+
+# Transform the independent variable t (trend)
+t.trans = artrans.wge(t, phi.tr = ar.z$phi)
+plotts.sample.wge(y.trans)    # looks like noise
+plotts.sample.wge(t.trans)
+```
+We regress y hat t on T hat t using OLS. After that we fit the models residuals into acf and ljung-box test to see if it is white noise. Afterwards we use the est.arma.wge to find the what type of model to fit noise to and to get the white noise variance.
+```{r}
+# regress y hat t on T hat t using OLS
+fitDaily = lm(y.trans~t.trans)
+summary(fitDaily)
+
+# evaluate the residuals( after Cochrane-Orcutt)
+
+plotts.wge(fitDaily$residuals)
+acf(fitDaily$residuals)
+lj = ljung.wge(fitDaily$residuals) # There is evidence that this is white noise. Pval = 0.99. Fail to reject.
+
+# phis and white noise variance
+x.z.est = est.arma.wge(x.z, p = ar.z$p) # sig plus noise phis
+x.z.est$avar  # the variance
+
+```
+The test shows that there is evidence that the residuals for the AR(10) model is white noise. The p-value is `r lj$pval` so we failed to reject the null hypothesis.
+
+#### ASE 
+For the ASE for signal plus noise model we also used the last 10 realization point to calculate the ASE of the model performance.
+```{r}
+# ASE for signal plus noise
+l = length(dailyRates)
+f = l-10
+foreDailyRates = fore.sigplusnoise.wge(dailyRates, max.p = 10, lastn = T, n.ahead = 10, limits = F)
+ASE = mean((foreDailyRates$f - dailyRates[f:l])^2)
+ASE
+ASE_SIG = ASE
+MAE = sqrt(ASE)
+
+Sig_DF = data.frame(Model = 'Signal Plus Noise', Mean_ABS_Error = MAE, Mean_Square_Error = ASE)
+
+```
+The ASE comes out to be `r ASE`
+
+#### AR(10) forcast
+The forecast performed similarly as the AR(10) model but signal plus noise models always continues with trend upwards. We suspect that as the forecast moves away or goes further in the future it would fade into predicting a straight line trend. Below shows the forecasts for 7 day period and a 90 day period with the upper and lower limits.
+```{r}
+# forecast short
+fore.sigplusnoise.wge(dailyRates, max.p = 10, n.ahead = 7, limits = T)
+
+# forecast long
+fore.sigplusnoise.wge(dailyRates, max.p = 10, n.ahead = 90, limits = T)
+
+```
+
+##### Ensemble model
+
+For the Ensemble we took the avg of the 2 models above.
+```{r}
+ASE_Ensemble = (ASE_SIG + ASE_AR_10)/2
+
+MAE = sqrt(ASE_Ensemble)
+
+Ensemble_DF = data.frame(Model = 'Ensemble', Mean_ABS_Error = MAE, Mean_Square_Error = ASE_Ensemble)
+
+```
+#### ASE Dataframe
+```{r}
+df = rbind(AR_10_DF,Sig_DF,Ensemble_DF)
+df
+```
+
+## Goal 3: Multivariate Analysis
+
+### Oklahoma
+In this section, we will look at some basic plots to determine how to approach the positive percentage.  The first decision to make is which other variables make sense for forecasting postive counts.  At first, it might seem like pending tests would be a good predictor.  However, upon inspection, there have been no pending numbers reporting since March, so that one is out.  The number of positive viral tests (as opposed to confirmed cases from tests that we have been using) seems like it might be promising.  After thinking about it, though, it includes both false and true positives.  The inherent inaccuracy of false positives doesn't seem like a good way to predict true positives, so we discounted that variable from consideration.  Many of the other variables either did not report any/enough data or aren't meaningful, like IDs and hash codes.
+
+Negative might work, but, again, using negatives to predict positives seems kind of clunky.  In the end, we chose in hospital currently and death count because those in the hospital today or who have died most likely had a positive test previously, thus making those two variables likely leading indicators.
+
+In order to predict using hospitalizations and deaths, however, we first need to execute univariate forecasts again those two variables.  Then, we can use the resulting forecasts to build the multivariate model for positive counts.
+
+#### Stationarity
+To examine stationarity, we need to make sure the mean and standard deviation are not dependent on time and that the correlation between two points depends only on its lag and not the time.
+``` {r}
+# Look at the basic time series plot for the positive percentage
+plotts.sample.wge(ok$positive)
+```
+Both the mean and standard deviation appear to trend upward over time, and the ACF shows a gradually damping behavior perhaps with a very slight sinusoidal tendency.  Based on this, the positive counts do not appear to be stationary.  The stationarity of the time series of interest would not be affected by the number of variables in the forecasting model but only on its own behavior; thus, the stationarity in this section will be the same result as in Goal 2.
+
+However, since we first need to build models for the independent variables, death and hospital, we should look at their stationarity, too.
+``` {r}
+plotts.sample.wge(ok$hospitalizedCurrently)
+plotts.sample.wge(ok$death)
+```
+Hospitalized currently seems to follow the pattern of positive counts in its realizations, ACF, and spectral density.  The slowly damping behavior and peak at 0 point to non-stationarity, and the realization seems to confirm it, since the mean and variance both seem dependent on time, and the second half of the ACF is different from the first half.
+
+For death counts, however, the plots are very different.  The realization seems to flucuate around a mean; however, the variance changes over time, and the ACF also changes as lags increase, so death counts would also be non-stationary.  There is also a peak at 0 in the spectral density, which indicates the wondering that we see in the realization along with the slowly damping ACFs.  However, there are also peaks at about .14, .29, and .42.  We will see about removing the non-staitionary portions for our forecasting models.
+#### Identification of stationary models
+We can overfit assuming stationarity to obtain potential models.  Then, we can use Llung-Box to verify that if we remove the stationary part of the model that all that is left is white noise.
+```{r}
+arma.aic = aic.wge(ok$positive, p = 0:15, q = 0:10)
+arma.aic.name = paste('ARMA(', arma.aic$p, ', ', arma.aic$q, ')', sep = '')
+arma.bic = aic.wge(ok$positive, p = 0:15, q = 0:10, type = 'bic')
+arma.bic.name = paste('ARMA(', arma.bic$p, ', ', arma.bic$q, ')', sep = '')
+
+est = est.arma.wge(ok$positive, p = arma.bic$p, q = arma.bic$q)
+pos.mean = mean(ok$positive)
+
+plotts.sample.wge(est$res, arlimits = T)
+
+lj24 = ljung.wge(est$res, p = arma.bic$p)
+lj24$pval
+
+lj48 = ljung.wge(est$res, p = arma.bic$p, K = 48)
+lj48$pval
+```
+Attemping to overfit the data, an AIC check returned an optimal fit at 
+`r arma.aic.name`
+.  This is a pretty complex model, so we checked with BIC.  That returned a more reasonable 
+`r arma.bic.name`
+, so we went with that.
+
+Factoring the model as an 
+`r arma.bic.name`
+ reveals just one root just barely outside the unit circle (possible 1-B alert!).  Interestingly, there is only one frequency at 0, which account for the realization wandering for the root at 0, though the spectral density seems to show very slight peaks at .11 and .31.  There doesn't seem to be any trend beyond a steady increase in positives.
+
+None the ACFs for the residuals exceeds the limit lines, which would be consistent with a 95% confidence interval, and the plot looks like white noise.  We can confirm that this is white noise.  As for the Llung-Box test, both K = 24 (p-value = 
+`r format(lj24$pval, digits = 3, nsmall = 2)`
+) and K = 48 (p-value = 
+`r format(lj48$pval, digits = 3, nsmall = 2)`
+) strongly failed to reject null that the residuals are white noise.  This is the result if we model it as a stationary model, remembering that it is ultimately the analyst's choice of which to choose.
+
+However, let's also see what happens if we do some differencing, treating it as a non-stationary model.
+``` {r}
+# Look at the first difference of the data
+pos.d1 = artrans.wge(ok$positive, phi.tr = 1)
+
+# It looks stationary from the plots, so let's try and estimate p and q
+arma.aic.d1 = aic.wge(pos.d1, p = 0:15, q = 0:10) 
+arma.aic.d1.name = paste('ARIMA(', arma.aic.d1$p, ', 1, ', arma.aic.d1$q, ')', sep = '')
+arma.bic.d1 = aic.wge(pos.d1, p = 0:15, q = 0:10, type = "bic")
+arma.bic.d1.name = paste('ARIMA(', arma.bic.d1$p, ', 1, ', arma.bic.d1$q, ')', sep = '')
+
+# Now estimate the difference
+est.d1 = est.arma.wge(pos.d1, p = arma.bic.d1$p, q = arma.bic.d1$q)
+est.d1$phi
+est.d1$theta
+est.d1$avar
+mean(ok$positive)
+```
+
+After looking at the differenced data, the final model was an 
+`r arma.bic.name`
+ with a (1 - B) term.  The final model is 
+`r format.glp(arma.bic.d1$phi, arma.bic.d1$theta, 1, 0, mean(ok$positive), arma.bic.d1$vara)`
+.  While this is interesting, we will proceed with the original 
+`r arma.bic.name`
+  model for further analysis.  This is because we believe that the data will eventually be more or less normally distributed and attract back to a mean once the number of cases begins to drop in the months ahead.
+
+#### Model building with ACFs, spectral densities, etc.
+Let's look at the true spectral density of the estimated 
+`r arma.bic.name`
+ model and compare to the original data.
+```{r}
+plotts.true.wge(phi = est$phi)
+plotts.sample.wge(ok$positive)
+x.gen = gen.arma.wge(n = 100, phi = est$phi)
+x.gen = x.gen + pos.mean
+plotts.sample.wge(x.gen)
+```
+While the realization appears different from the original data's realization, both the ACFs and spectral densities appear very similar.  The spectral density has (very small) peaks at the same spots, and the ACF show minor sinusoidal and slowly damping behavior.
+
+#### Evaluate candidate models
+We need to evaluate the 
+`r arma.bic.name`
+ model and also compare it to a possible weekly seasonal model.
+
+##### ARMA/ARIMA model
+The final possible 
+`r arma.bic.name`
+ model would be 
+`r format.glp(arma.bic$phi, arma.bic$theta, 0, 0, mean(ok$positive), arma.bic$vara)`
+.
+
+###### AIC
+```{r}
+fore.7days = fore.arma.wge(ok$positive, phi = est$phi, n.ahead = 7, lastn = T)
+fore.90days = fore.arma.wge(ok$positive, phi = est$phi, n.ahead = 90, lastn = T)
+
+arma.aic$value
+arma.bic$value
+```
+The AIC is 
+`r format(arma.aic$value, digits = 3, nsmall = 2)`
+, and the BIC is 
+`r format(arma.bic$value, digits = 3, nsmall = 2)`
+.
+
+###### ASE
+```{r}
+ASE.AR7.7days = mean((fore.7days$f - ok$positive[(n-7+1):n])^2)
+ASE.AR7.90days = mean((fore.90days$f - ok$positive[(n-90+1):n])^2)
+ASE.AR7.7days
+ASE.AR7.90days
+```
+The ASE for a 7 day forecast is 
+`r ifelse(ASE.AR7.7days < ASE.AR7.90days, 'better ', 'worse ')`
+than the ASE for a 90 day forecast.
+
+###### Visualization
+We can use the 
+`r arma.bic.name`
+ model to predict the next 7 and 90 days.
+``` {r}
+fore.arma.wge(ok$positive, phi = est$phi, n.ahead = 7, lastn = F)
+fore.arma.wge(ok$positive, phi = est$phi, n.ahead = 90, lastn = F)
+```
+The visual for the 7 day forecast appears very similar initially to recent spikes in the positive count and then trails toward the mean.  Because the time horizon is so much longer on the 90 day forecast, you can definitely see it diminishing toward the mean over time.
+
+##### ARMA/ARIMA model
+Given that the period of 7 is likely considering the nature of the data, it's also possible we may be dealing with a seasonal model that repeats weekly.  Let's explore that possibility.  First, if we assume that there is a (1 - B^7) term, then let's remove that and see what we have left.
+```{r}
+ok.d = artrans.wge(ok$positive, phi.tr = c(rep(0, 6), 1))
+```
+
+Since the resulting difference after removing (1-B^7) doesn't appear white, let's see if we can fit an ARMA model to the remainder.
+``` {r}
+ok.d.aic = aic.wge(ok.d, p = 0:15, q = 0:10)
+ok.d.aic.name = paste('ARMA(', ok.d.aic$p, ', ', ok.d.aic$q, ')', sep = '')
+ok.d.bic = aic.wge(ok.d, p = 0:15, q = 0:10, type = 'bic')
+ok.d.bic.name = paste('ARMA(', ok.d.bic$p, ', ', ok.d.bic$q, ')', sep = '')
+
+ok.d.aic 
+ok.d.bic
+```
+The AIC analysis of the non-seasonal portion picked an 
+`r ok.d.aic.name`
+ model, and the non-seasonal part of BIC chose 
+`r ok.d.bic.name`
+.  The BIC is not only clearly much simpler but also indicates some likely cancellation of the terms in AIC.  We will choose the BIC form, which would leave us with a seasonal model of 
+`r format.glp(ok.d.bic$phi, ok.d.bic$theta, 0, 7, mean(ok$positive), ok.d.bic$vara)`
+.
+
+###### AIC
+``` {r}
+ok.d.aic$value
+ok.d.bic$value
+```
+Again, the AIC is a bit lower at 
+`r format(ok.d.aic$value, digits = 2, nsmall = 2)`
+; however, the BIC of 
+`r format(ok.d.bic$value, digits = 2, nsmall = 2)`
+ is close and results in a simpler model.
+
+###### ASE
+Now we need to calculate the forecasted values in order to find the ASE for both 7 and 90 days.
+``` {r}
+fore.seasonal.7days = fore.aruma.wge(ok$positive, s = 7, n.ahead = 7, lastn = T)
+fore.seasonal.90days = fore.aruma.wge(ok$positive, s = 7, n.ahead = 90, lastn = T)
+
+ASE.seasonal.7days = mean((fore.seasonal.7days$f - ok$positive[(n-7+1):n])^2)
+ASE.seasonal.90days = mean((fore.seasonal.90days$f - ok$positive[(n-90+1):n])^2)
+ASE.seasonal.7days
+ASE.seasonal.90days
+```
+Again, the ASE for the 7 day forecast is 
+`r ifelse(ASE.seasonal.7days < ASE.seasonal.90days, 'better ', 'worse ')`
+than for the 90 day forecast.  Interestingly, the 7 day seasonal forecast is also 
+`r ifelse(ASE.seasonal.7days < ASE.AR7.7days, 'better ', 'worse ')`
+than the 7 day 
+`r arma.bic.name`
+ model; however, the seasonal 3 month forecast is 
+`r ifelse(ASE.seasonal.90days < ASE.AR7.90days, 'better ', 'worse ')`
+than the 
+`r arma.bic.name`
+ model.
+
+###### Visualization
+Let's use the seasonal model to predict into the future.
+``` {r}
+fore.aruma.wge(ok$positive, s = 7, n.ahead = 7, lastn = F)
+fore.aruma.wge(ok$positive, s = 7, n.ahead = 90, lastn = F)
+```
+You can see from the visualization of the seasonal model that the next 7 days prediction appears almost the same as recent data points.  The 90 day model also replicates the pattern, continuing the trend at the point where we started forecasting.
+
+##### MLP/RNN model
+For the MLP model, we first allowed the mlp function to take its best guess at fitting the data and parameters, after which we plotted the model, forecast using the model, and plotted that forecast. 
+``` {r}
+# Put our data into to a time series object
+pos.ts.train = ts(data = ok$positive, start = 1, end = round(n*.8))
+pos.ts.test = ts(data = ok$positive, start = (length(pos.ts.train) + 1), end = n)
+
+# Fit an MLP model
+set.seed(2)
+pos.mlp = mlp(pos.ts.train, reps = 50, comb = "mean")
+pos.mlp
+plot(pos.mlp)
+
+# Forecast the model to find the ASE
+pos.mlp.fore = forecast(pos.mlp, h = length(pos.ts.test))
+plot(pos.mlp.fore)
+
+# Calculate the ASE
+pos.mlp.ase = mean((pos.ts.test - pos.mlp.fore$mean)^2)
+pos.mlp.ase
+
+# Now try the MLP without seasonal using weekly lags
+pos.mlp2 = mlp(pos.ts.train, reps = 50, comb = "mean", allow.det.season = F, lags = c(1,2,3,4,5,6,7))
+pos.mlp2
+plot(pos.mlp2)
+
+# Forecast the model to find the ASE
+pos.mlp.fore2 = forecast(pos.mlp2, h = length(pos.ts.test))
+plot(pos.mlp.fore2)
+
+# Calculate the ASE
+pos.mlp.ase2 = mean((pos.ts.test - pos.mlp.fore2$mean)^2)
+pos.mlp.ase2 
+```
+The ASE was 
+`r format(pos.mlp.ase, digits = 2, nsmall = 2)`
+.  Then, we took the reigns a bit and disabled seasonality while specifying weekly lags.  The resulting ASE was 
+`r format(pos.mlp.ase2, digits = 2, nsmall = 0)`
+.  The first ASE is slightly 
+`r ifelse(pos.mlp.ase < pos.mlp.ase2, 'better', 'worse')`
+, so that is the model that we will use.
+
+For the 7 and 90 day forecasts, we first retrained the model using all of the data available.  If we had only used the training set, then a substantial portion of the trend to date would be lost, and the resulting forecasts would be way off.  Next, we forecast for 7 and 90 days.  Both forecasts continue the trend that was immediately before the forecast range.
+
+``` {r}
+# The first MLP model wins, so use that for the 7 and 90 day forecasts
+# First, train the model using the entire dataset
+pos.ts.full = ts(data = ok$positive, start = 1, end = n)
+pos.mlp.full = mlp(pos.ts.full, reps = 50, comb = "mean")
+
+# Now forecast into the future 7 days
+pos.mlp.fore.7day = forecast(pos.mlp.full, h = 7)
+plot(pos.mlp.fore.7day)
+
+# .. and 90 days
+pos.mlp.fore.90day = forecast(pos.mlp.full, h = 90)
+plot(pos.mlp.fore.90day)
+```
+h
+##### Ensemble model
+``` {r}
+# Put together the ensemble model - 7 days
+ensemble.7day.pred = (fore.7days$f + fore.seasonal.7days$f + pos.mlp.fore.7day$mean) / 3
+ensemble.7day.ul = (fore.7days$ul + fore.seasonal.7days$ul) / 2
+ensemble.7day.ll = (fore.7days$ll + fore.seasonal.7days$ll) / 2
+
+# Prepare the data frames
+df.obs = data.frame(time = seq(1, n), obs = ok$positive, group = "obs")  # Original data
+df.preds = data.frame(time = seq((n+1), (n+length(ensemble.7day.pred))), obs = as.numeric(ensemble.7day.pred), group = "pred")  # Predictions with confidence limits
+
+# Plot the predictions
+ggplot(data = df.obs, aes(x = time, y = obs)) +
+  geom_line(color = 'black') +
+  labs(title = 'Ensemble Forecasts', subtitle = '7 Days', x = 'Days from Start of Outbreak', y = 'Patients Who Tested Positive') +
+  geom_smooth(aes(x = time, y = obs, ymax = ensemble.7day.ul, ymin = ensemble.7day.ll), color = 'red', data = df.preds, stat = "identity") +
+  theme(plot.title = element_text(hjust = .5, family = 'Franklin Gothic Demi'),
+        plot.subtitle = element_text(hjust = .5, color = 'red', face = 'italic', family = 'Franklin Gothic Demi'),
+        axis.title = element_text(face = 'italic', family = 'Franklin Gothic Medium'))
+
+# Put together the ensemble model - 90 days
+ensemble.90day.pred = (fore.90days$f + fore.seasonal.90days$f + pos.mlp.fore.90day$mean) / 3
+ensemble.90day.ul = (fore.90days$ul + fore.seasonal.90days$ul) / 2
+ensemble.90day.ll = (fore.90days$ll + fore.seasonal.90days$ll) / 2
+
+# Prepare the data frames
+df.obs = data.frame(time = seq(1, n), obs = ok$positive, group = "obs")  # Original data
+df.preds = data.frame(time = seq((n+1), (n+length(ensemble.90day.pred))), obs = as.numeric(ensemble.90day.pred), group = "pred")  # Predictions with confidence limits
+
+# Plot the predictions
+ggplot(data = df.obs, aes(x = time, y = obs)) +
+  geom_line(color = 'black') +
+  labs(title = 'Ensemble Forecasts', subtitle = '90 Days', x = 'Days from Start of Outbreak', y = 'Patients Who Tested Positive') +
+  geom_smooth(aes(x = time, y = obs, ymax = ensemble.90day.ul, ymin = ensemble.90day.ll), color = 'red', data = df.preds, stat = "identity") +
+  theme(plot.title = element_text(hjust = .5, family = 'Franklin Gothic Demi'),
+        plot.subtitle = element_text(hjust = .5, color = 'red', face = 'italic', family = 'Franklin Gothic Demi'),
+        axis.title = element_text(face = 'italic', family = 'Franklin Gothic Medium'))
+```
+The ensemble models are an average of the three other models; stationary, seasonal, and mlp.  The 7-day ensemble definitely seems to continue the prevailing trend, whereas the 90-day ensemble continues forward around a mean near the final point of the data.
+
+### National (Multivariate)
+We will first look at the features that would be correlated to the daily positive case. If correlated we would model those features and use them as predictor variables for the daily cases.
+```{r}
+ggpairs(dataGrouped %>% dplyr::select(positiveIncrease_sum,negativeIncrease_sum, deathIncrease_sum,totalTestResults_sum,positive_perc,hospitalizedCurrently_sum))
+
+```
+From the correlation plot we would use daily negative cases, total test results, daily positve percent rate and the daily patients currently hospitalized to model the daily positive case. 
+
+##### Model the explanatory variables
+###### Hospitalized Currrently
+```{r}
+
+plotts.sample.wge(dataGrouped$hospitalizedCurrently)
+aic = aic.wge(dataGrouped$hospitalizedCurrently,p = 0:10, q = 0:2, type = 'bic')
+hospital = est.arma.wge(dataGrouped$hospitalizedCurrently,p = aic$p, q = aic$q)
+acf(hospital$res)
+ljung.wge(hospital$res, p = aic$p, q = aic$q)
+ljung.wge(hospital$res, p = aic$p, q = aic$q, K = 48)
+
+hospitalFore7 = fore.arma.wge(dataGrouped$hospitalizedCurrently, phi = hospital$phi, theta = hospital$theta, n.ahead = 7)
+hospitalFore90 = fore.arma.wge(dataGrouped$hospitalizedCurrently, phi = hospital$phi, theta = hospital$theta, n.ahead = 90)
+
+hospitalFore7 = hospitalFore7$f
+hospitalFore90 = hospitalFore90$f
+```
+###### Daily Positive Percent Rate
+We model daily positive percent with ana aruma model. The parzen window shows a frequency at about 0.14 so this suggegsts a period of about 7 so we differenced the data and resulting residual is consistent with white noise. We forecast a 7 day and 90 days to use for our multivariate model.
+```{r}
+plotts.sample.wge(dataGrouped$positive_perc)
+perc_07= artrans.wge(dataGrouped$positive_perc, c(rep(0,6),1))
+aic = aic.wge(perc_07,p = 0:10, q = 0:2, type = 'bic')
+#aic = aic.wge(dataGrouped$positive_perc,p = 0:10, q = 0:2, type = 'bic')
+#perc = est.arma.wge(dataGrouped$positive_perc,p = aic$p, q = aic$q)
+perc = est.arma.wge(perc_07,p = aic$p, q = aic$q)
+
+acf(perc$res) 
+ljung.wge(perc$res, p = aic$p, q = aic$q)
+ljung.wge(perc$res, p = aic$p, q = aic$q, K = 48)
+
+percFore7 = fore.aruma.wge(dataGrouped$positive_perc, phi = perc$phi, s = 7, theta = perc$theta, n.ahead = 7)
+percFore90 = fore.aruma.wge(dataGrouped$positive_perc, phi = perc$phi, s = 7, theta = perc$theta, n.ahead = 90)
+
+
+percFore7 = percFore7$f
+percFore90 = percFore90$f
+
+```
+###### Daily Total Test
+We model daily total test using signal plus noise because as you can se that the realization has an upward trend. We fit a trend as the independent variable with the daily total test as the dependent variable. We forecast a 7 day and 90 days to use for our multivariate model.
+```{r}
+
+library(orcutt)
+x = dataGrouped$totalTestResults_sum
+n = length(x)
+t = 1:n
+d = lm(x~t)
+x.z = x - d$coefficients[1] - d$coefficients[2]*t
+
+
+ar.z = aic.wge(x.z, p = 0:15, q = 0:2) # ar.z$p is 10
+
+# Tranform the dependent varible daily rates 
+y.trans = artrans.wge(x, phi.tr = ar.z$phi)
+
+# Transform the independent variable t (trend)
+t.trans = artrans.wge(t, phi.tr = ar.z$phi)
+plotts.sample.wge(y.trans)    # looks like noise
+plotts.sample.wge(t.trans)
+
+
+# regress y hat t on T hat t using OLS
+fitTotal = lm(y.trans~t.trans)
+
+# evaluate the residuals( after Cochrane-Orcutt)
+
+plotts.wge(fitTotal$residuals)
+acf(fitTotal$residuals)
+ljung.wge(fitTotal$residuals) # There is evidence that this is white noise. Pval = 0.99. Fail to reject.
+ljung.wge(fitTotal$residuals, K = 48)
+
+# phis and white noise variance
+x.z.est = est.arma.wge(x.z, p = ar.z$p, q = ar.z$q) # sig plus noise phis
+
+x.z.est$avar  # the variance
+
+# ASE for signal plus noise
+totalFore7 = fore.sigplusnoise.wge(dataGrouped$totalTestResults, max.p = 10, n.ahead = 7)
+totalFore90 = fore.sigplusnoise.wge(dataGrouped$totalTestResults, max.p = 10, n.ahead = 90)
+
+totalFore7 = totalFore7$f
+totalFore90 = totalFore90$f
+
+```
+###### Daily Negative Test
+We model negative test using arima model because there is a trend in the data with some frequency. After differencing the trend, the residual seem to be consistent with white noise. We forecast a 7 day and 90 days to use for our multivariate model.
+```{r}
+
+plotts.sample.wge(dataGrouped$negativeIncrease_sum)
+negativeInc_01= artrans.wge(dataGrouped$negativeIncrease_sum, c(rep(0,0),1))
+aic = aic.wge(dataGrouped$negativeIncrease_sum,p = 0:10, q = 0:2, type = 'bic')
+negative = est.arma.wge(dataGrouped$negativeIncrease_sum,p = aic$p, q = aic$q)
+
+acf(negative$res)
+ljung.wge(negative$res, p = aic$p, q = aic$q)
+ljung.wge(negative$res, p = aic$p, q = aic$q, K = 48)
+
+negativeFore7 = fore.aruma.wge(dataGrouped$negativeIncrease_sum, phi = perc$phi, d = 1, theta = perc$theta, n.ahead = 7)
+negativeFore90 = fore.aruma.wge(dataGrouped$negativeIncrease_sum, phi = perc$phi, d = 1, theta = perc$theta, n.ahead = 90)
+
+negativeFore7 = negativeFore7$f
+negativeFore90 = negativeFore90$f
+```
+#### Multivariate Analysis
+
+Below we will start our multivariate model analysis for national data. We will first explored modeling using MLP. We also used VAR model and MLR models for or multivariate model analysis. For every model we build there would be 7 days and 90 days of forecast. We also would be comparing the ASE for overall as well as a rolling window ASE to see which one that performed better. A horizon of 10 was used for both ASE for all data set as well as the rolling window.
+
+##### MLP model
+
+```{r}
+
+len = length(dataGrouped$positiveIncrease_sum)
+trainingSize = 80
+horizon = 10
+Fore7 = 7
+Fore90 = 90
+ASEHolder = numeric()
+
+for( i in 1:(len-(trainingSize + horizon) + 1))
+{
+  DataDF = data.frame(negInc = ts(dataGrouped$negativeIncrease[i:(i+(trainingSize-1))]),test =  ts(dataGrouped$totalTestResults[i:(i+(trainingSize-1))]),hospCur = ts(dataGrouped$hospitalizedCurrently[i:(i+(trainingSize-1))]),dPerc = ts(dataGrouped$positive_perc[i:(i+(trainingSize-1))]))
+  
+fit.mlp = mlp(ts(dataGrouped$positiveIncrease[i:(i+(trainingSize-1))]),reps = 20,comb = "mode",xreg = DataDF)
+  
+foreAllDF = data.frame(negInc = ts(dataGrouped$negativeIncrease[(i):(trainingSize+ i + (horizon) - 1)]), test =  ts(dataGrouped$totalTestResults[(i):(trainingSize+ i + (horizon) - 1)]),hospCur = ts(dataGrouped$hospitalizedCurrently[(i):(trainingSize+ i + (horizon) - 1)]),dPerc = ts(dataGrouped$positive_perc[(i):(trainingSize+ i + (horizon) - 1)]))
+  
+fore.mlp = forecast(fit.mlp, h = horizon, xreg = foreAllDF)
+
+ASE = mean((dataGrouped$positiveIncrease[(trainingSize+i):(trainingSize+ i + (horizon) - 1)] - fore.mlp$mean)^2)
+         
+ASEHolder[i] = ASE
+
+}
+
+ASEHolder = ASEHolder[!is.na(ASEHolder)]
+hist(ASEHolder)
+WindowedASE_MLP = mean(ASEHolder)
+
+summary(ASEHolder)
+
+Win_ABS_Error = sqrt(WindowedASE)
+# Visualization
+# ASE for entire data with last 10 forecast
+DataSmallDF = data.frame(negInc = ts(dataGrouped$negativeIncrease[(1:(len-10))]),test =  ts(dataGrouped$totalTestResults[(1:(len-10))]),hospCur = ts(dataGrouped$hospitalizedCurrently[(1:(len-10))]),dPerc = ts(dataGrouped$positive_perc[(1:(len-10))]))
+
+fit.mlp = mlp(ts(dataGrouped$positiveIncrease[(1:(len-10))]),reps = 20,comb = "mean",xreg = DataSmallDF)
+
+foreAllDF = data.frame(negInc = ts(dataGrouped$negativeIncrease), test =  ts(dataGrouped$totalTestResults),hospCur = ts(dataGrouped$hospitalizedCurrently),dPerc = ts(dataGrouped$positive_perc))
+
+fore.mlp = forecast(fit.mlp, h = horizon, xreg = foreAllDF)
+
+ASE = mean((dataGrouped$positiveIncrease[(len-9):len] - fore.mlp$mean)^2)
+ASE
+
+MAE = sqrt(ASE)
+
+MLP_DF = data.frame(Model = 'MLP', Mean_ABS_Error = MAE, Mean_Square_Error = ASE, Roll_window_Mean_ABS_Error = Win_ABS_Error, Roll_window_Mean_Square_Error = WindowedASE)
+
+dev.off()
+plot(seq(1,len,1), dataGrouped$positiveIncrease, type = "l",xlim = c(0,len), ylab = "New Daily Cases", main = paste(as.character(horizon),"Days Forecast n.ahead = 10"))
+lines(seq((len-9),len,1), fore.mlp$mean, type = "l", col = "red")
+
+
+
+```
+
+##### MLP Forecasts 7 Days
+
+```{r}
+DataDF = data.frame(negInc = as.double(dataGrouped$negativeIncrease),test =as.double(dataGrouped$totalTestResults),hospCur = dataGrouped$hospitalizedCurrently, dPerc = dataGrouped$positive_perc)
+
+fore07DF = data.frame(negInc = as.double( negativeFore7), test = as.double(totalFore7),hospCur = hospitalFore7,dPerc = percFore7)
+
+foreAllDF = rbind(DataDF,fore07DF)
+
+DataDF = data.frame(negInc = ts(as.double(dataGrouped$negativeIncrease)),test =  ts(as.double(dataGrouped$totalTestResults)),hospCur = ts(dataGrouped$hospitalizedCurrently), dPerc = ts(dataGrouped$positive_perc))
+
+fit.mlp = mlp(ts(dataGrouped$positiveIncrease),reps = 20,comb = "mean",xreg = DataDF)
+
+fore.mlp = forecast(fit.mlp, h = 7, xreg = foreAllDF)
+
+plot(fore.mlp)
+
+dev.off()
+plot(seq(1,len,1), dataGrouped$positiveIncrease, type = "l",xlim = c(0,len+7), ylab = "New Daily Cases", main = paste(as.character(7),"Days Forecast"))
+lines(seq(len,(len+6),1), fore.mlp$mean, type = "l", col = "red")
+
+```
+
+##### MLP 90 day Forecast
+````{r}
+
+DataDF = data.frame(negInc = as.double(dataGrouped$negativeIncrease),test =as.double(dataGrouped$totalTestResults),hospCur = dataGrouped$hospitalizedCurrently, dPerc = dataGrouped$positive_perc)
+
+fore90DF = data.frame(negInc = as.double( negativeFore90), test = as.double(totalFore90),hospCur = hospitalFore90,dPerc = percFore90)
+
+foreAllDF = rbind(DataDF,fore90DF)
+
+DataDF = data.frame(negInc = ts(as.double(dataGrouped$negativeIncrease)),test =  ts(as.double(dataGrouped$totalTestResults)),hospCur = ts(dataGrouped$hospitalizedCurrently), dPerc = ts(dataGrouped$positive_perc))
+
+fit.mlp = mlp(ts(dataGrouped$positiveIncrease),reps = 20,comb = "mean",xreg = DataDF)
+
+fore.mlp = forecast(fit.mlp, h = 90, xreg = foreAllDF)
+
+plot(fore.mlp)
+
+dev.off()
+plot(seq(1,len,1), dataGrouped$positiveIncrease, type = "l",xlim = c(0,len+90), ylab = "New Daily Cases", main = paste(as.character(90),"Days Forecast"))
+lines(seq(len,(len+89),1), fore.mlp$mean, type = "l", col = "red")
+
+````
+
+
+#### VAR Model (Percent change can be model but can not generate forecasts when the entire dataset is used)
+```{r}
+
+ASEHolder = numeric()
+
+for( i in 1:(len-(trainingSize + horizon) + 1))
+{
+CoroVar = VAR(cbind(dataGrouped$positiveIncrease[i:(i+(trainingSize-1))],dataGrouped$negativeIncrease[i:(i+(trainingSize-1))],dataGrouped$totalTestResults[i:(i+(trainingSize-1))],dataGrouped$hospitalizedCurrently[i:(i+(trainingSize-1))]), type = "both", lag.max = 10) 
+
+preds = predict(CoroVar,n.ahead = horizon) 
+ASE = mean((dataGrouped$positiveIncrease[(trainingSize+i):(trainingSize+ i + (horizon) - 1)] - preds$fcst$y1[,1])^2)
+         
+ASEHolder[i] = ASE
+
+}
+
+ASEHolder = ASEHolder[!is.na(ASEHolder)]
+hist(ASEHolder)
+WindowedASE = mean(ASEHolder)
+
+summary(ASEHolder)
+WindowedASE
+Win_ABS_Error = sqrt(WindowedASE)
+
+# Visualization
+# ASE for entire data with last 10 forecast
+smallData <- dataGrouped[1:(len-10),]
+CoroVar = VAR(cbind(smallData$positiveIncrease,smallData$negativeIncrease,smallData$totalTestResults,smallData$hospitalizedCurrently), type = "both", lag.max = 10)
+
+preds = predict(CoroVar,n.ahead = horizon) 
+
+ASE = mean((dataGrouped$positiveIncrease[(len-9):len] - preds$fcst$y1[,1])^2)
+ASE
+
+MAE = sqrt(ASE)
+
+VAR_DF = data.frame(Model = 'VAR', Mean_ABS_Error = MAE, Mean_Square_Error = ASE, Roll_window_Mean_ABS_Error = Win_ABS_Error, Roll_window_Mean_Square_Error = WindowedASE)
+
+dev.off()
+plot(seq(1,len,1), dataGrouped$positiveIncrease, type = "l",xlim = c(0,len), ylab = "New Daily Cases", main = paste(as.character(horizon),"Days Forecast n.ahead = 10"))
+lines(seq((len-9),len,1), preds$fcst$y1[,1], type = "l", col = "red")
+
+
+```
+
+##### VAR Model 7 day Forcast
+
+```{r}
+CoroVar = VAR(cbind(dataGrouped$positiveIncrease,dataGrouped$negativeIncrease,dataGrouped$totalTestResults,dataGrouped$hospitalizedCurrently), type = "both", lag.max = 10)
+
+preds = predict(CoroVar,n.ahead = 7) 
+
+plot(preds)
+
+dev.off()
+plot(seq(1,len,1), dataGrouped$positiveIncrease, type = "l",xlim = c(0,len+7), ylab = "New Daily Cases", main = paste(as.character(7),"Days Forecast"))
+lines(seq(len,(len+6),1), preds$fcst$y1[,1], type = "l", col = "red")
+
+```
+
+##### VAR Model 90 Day Forecast
+```{r}
+CoroVar = VAR(cbind(dataGrouped$positiveIncrease,dataGrouped$negativeIncrease,dataGrouped$totalTestResults,dataGrouped$hospitalizedCurrently), type = "both", lag.max = 10)
+
+preds = predict(CoroVar,n.ahead = 90) 
+
+plot(preds)
+
+plot(seq(1,len,1), dataGrouped$positiveIncrease, type = "l",xlim = c(0,len+90), ylim=c(0,140000),  ylab = "New Daily Cases", main = paste(as.character(90),"Days Forecast"))
+lines(seq(len,(len+89),1), preds$fcst$y1[,1], type = "l", col = "red")
+
+```
+
+##### MLR Model
+
+```{r}
+
+################################ MLR ########################################
+ccf(dataGrouped$negativeIncrease,dataGrouped$positiveIncrease)
+ccf(dataGrouped$totalTestResults,dataGrouped$positiveIncrease)
+ccf(dataGrouped$hospitalizedCurrently,dataGrouped$positiveIncrease)
+ccf(dataGrouped$positive_perc,dataGrouped$positiveIncrease)
+dataGrouped$lagtest = dplyr::lag(dataGrouped$totalTestResults,3)
+dataGrouped$leadhosp = dplyr::lead(dataGrouped$hospitalizedCurrently,2)
+dataGrouped$leadPositive_perc = dplyr::lead(dataGrouped$positive_perc,4)
+
+######################### Begin ##########################
+Corofit = lm(positiveIncrease_sum~negativeIncrease_sum + leadhosp + lagtest + leadPositive_perc, data = dataGrouped)
+phi = aic.wge(Corofit$residuals)
+ljung.wge(Corofit$residuals) 
+ljung.wge(Corofit$residuals, K = 48)
+
+
+ASEHolder = numeric()
+
+for( i in 1:(len-(trainingSize + horizon) + 1))
+{
+smallData <- dataGrouped[i:(i+(trainingSize-1)),]
+Corofit = lm(positiveIncrease_sum~negativeIncrease_sum + leadhosp + lagtest + leadPositive_perc, data = smallData)
+phi = aic.wge(Corofit$residuals)
+
+DataForeDF = data.frame(lagtest= dataGrouped$lagtest[(trainingSize+i):(trainingSize+ i + (horizon) - 1)],leadhosp = dataGrouped$leadhosp[(trainingSize+i):(trainingSize+ i + (horizon) - 1)], negativeIncrease_sum = dataGrouped$negativeIncrease[(trainingSize+i):(trainingSize+ i + (horizon) - 1)], leadPositive_perc = dataGrouped$leadPositive_perc[(trainingSize+i):(trainingSize+ i + (horizon) - 1)])
+
+
+resids = fore.arma.wge(Corofit$residuals,phi = phi$phi,n.ahead = horizon)
+
+
+preds = predict(Corofit, newxreg = DataForeDF)
+
+predsFinal = preds + resids$f
+
+predsFinal <- as.numeric(predsFinal)
+
+ASE = mean((dataGrouped$positiveIncrease[(trainingSize+i):(trainingSize+ i + (horizon) - 1)] - predsFinal)^2)
+
+ASEHolder[i] = ASE
+
+}
+
+
+
+smallData <- dataGrouped[1:(len-10),]
+Corofit = lm(positiveIncrease_sum~negativeIncrease_sum + leadhosp + lagtest + leadPositive_perc, data = smallData)
+phi = aic.wge(Corofit$residuals)
+
+DataForeDF = data.frame(lagtest= dataGrouped$lagtest[(len-9):len],leadhosp = dataGrouped$leadhosp[(len-9):len], negativeIncrease_sum = dataGrouped$negativeIncrease[(len-9):len], leadPositive_perc = dataGrouped$leadPositive_perc[(len-9):len])
+
+
+resids = fore.arma.wge(Corofit$residuals,phi = phi$phi,n.ahead = horizon)
+
+
+preds = predict(Corofit, newdata = DataForeDF)
+
+predsFinal = preds + resids$f
+
+predsFinal <- as.numeric(predsFinal)
+
+ASE = mean((dataGrouped$positiveIncrease[(trainingSize+i):(trainingSize+ i + (horizon) - 1)] - predsFinal)^2)
+
+
+ASEHolder = ASEHolder[!is.na(ASEHolder)]
+hist(ASEHolder)
+WindowedASE = mean(ASEHolder)
+Win_ABS_Error = sqrt(WindowedASE)
+
+summary(ASEHolder)
+WindowedASE
+ASE
+
+MAE = sqrt(ASE)
+
+MLR_DF = data.frame(Model = 'MLR', Mean_ABS_Error = MAE, Mean_Square_Error = ASE, Roll_window_Mean_ABS_Error = Win_ABS_Error, Roll_window_Mean_Square_Error = WindowedASE)
+
+dev.off()
+plot(seq(1,len,1), dataGrouped$positiveIncrease, type = "l",xlim = c(0,len), ylab = "New Daily Cases", main = paste(as.character(horizon),"Days Forecast n.ahead = 10"))
+lines(seq((len-9),len,1), predsFinal, type = "l", col = "red")
+
+
+
+
+
+```
+
+##### MLR Model 7 Day Forecast
+```{r}
+
+Corofit = lm(positiveIncrease_sum~negativeIncrease_sum + leadhosp + lagtest + leadPositive_perc, data = dataGrouped)
+phi = aic.wge(Corofit$residuals)
+
+fore7DF = data.frame(negativeIncrease_sum = as.double( negativeFore7), lagtest = as.double(totalFore7),leadhosp = hospitalFore7,leadPositive_perc = percFore7)
+
+resids = fore.arma.wge(Corofit$residuals,phi = phi$phi,n.ahead = 7)
+
+
+preds = predict(Corofit, newdata = fore7DF)
+
+predsFinal = preds + resids$f
+
+predsFinal <- as.numeric(predsFinal)
+
+dev.off()
+
+plot(seq(1,len,1), dataGrouped$positiveIncrease, type = "l",xlim = c(0,len+7), ylim=c(0,100000),  ylab = "New Daily Cases", main = paste(as.character(7),"Days Forecast"))
+lines(seq(len,(len+6),1), predsFinal, type = "l", col = "red")
+```
+##### MLR Model 90 Day Forecast
+```{r}
+
+Corofit = lm(positiveIncrease_sum~negativeIncrease_sum + leadhosp + lagtest + leadPositive_perc, data = dataGrouped)
+phi = aic.wge(Corofit$residuals)
+
+fore90DF = data.frame(negativeIncrease_sum = as.double( negativeFore90), lagtest = as.double(totalFore90),leadhosp = hospitalFore90,leadPositive_perc = percFore90)
+
+resids = fore.arma.wge(Corofit$residuals,phi = phi$phi,n.ahead = 90)
+
+
+preds = predict(Corofit, newdata = fore90DF)
+
+predsFinal = preds + resids$f
+
+predsFinal <- as.numeric(predsFinal)
+
+dev.off()
+
+plot(seq(1,len,1), dataGrouped$positiveIncrease, type = "l",xlim = c(0,len+90), ylim=c(0,350000),  ylab = "New Daily Cases", main = paste(as.character(90),"Days Forecast"))
+lines(seq(len,(len+89),1), predsFinal, type = "l", col = "red")
+```
+##### Ensemble model
+```{r}
+ASE = (MLP_DF$ASE + VAR_DF$ASE + MLR_DF$ASE)/3
+
+WindowedASE = (MLP_DF$WindowedASE + VAR_DF$WindowedASE + MLR_DF$WindowedASE)/3
+
+MAE = sqrt(ASE)
+
+Win_ABS_Error = sqrt(WindowedASE)
+
+Ensemble_DF = data.frame(Model = 'Ensemble', Mean_ABS_Error = MAE, Mean_Square_Error = ASE, Roll_window_Mean_ABS_Error = Win_ABS_Error, Roll_window_Mean_Square_Error = WindowedASE)
+
+df = rbind(VAR_DF,MLP_DF,MLR_DF,Ensemble_DF)
+df
+```
+
